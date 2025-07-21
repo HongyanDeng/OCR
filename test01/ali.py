@@ -27,7 +27,7 @@ def image_to_base64(img_path):
 
 
 def send_ocr_request():
-    """发送 OCR 请求并返回识别结果"""
+    """发送 OCR 请求并返回结构化识别结果"""
     image_data = image_to_base64(IMAGE_PATH)
 
     headers = {
@@ -42,7 +42,7 @@ def send_ocr_request():
         "configure": {
             "min_size": 16,
             "output_prob": True,
-            "output_keypoints": False,
+            "output_keypoints": True,
             "skip_detection": False,
             "without_predicting_direction": False,
         }
@@ -51,19 +51,51 @@ def send_ocr_request():
     try:
         response = requests.post(REQUEST_URL, headers=headers, data=json.dumps(payload))
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            if data.get("success"):
+                return data.get("ret", [])
+            else:
+                print("API 返回失败，错误信息：", data)
+                return []
         else:
             print("请求失败，状态码：", response.status_code)
             print("错误信息：", response.text)
-            return None
+            return []
     except Exception as e:
         print("请求异常：", e)
-        return None
+        return []
+
+
+def extract_words(ocr_result):
+    """提取所有识别出的文字内容"""
+    return [item.get("word") for item in ocr_result if "word" in item]
+
+
+def extract_words_with_prob(ocr_result):
+    """提取文字内容及置信度"""
+    return [(item.get("word"), item.get("prob")) for item in ocr_result if "word" in item]
+
+
+def filter_by_prob(ocr_result, threshold=0.9):
+    """根据置信度过滤识别结果"""
+    return [item for item in ocr_result if item.get("prob", 0) >= threshold]
 
 
 if __name__ == "__main__":
     result = send_ocr_request()
+
     if result:
-        print("识别结果：")
-        for item in result.get("result", []):
-            print(item.get("text"))
+        print("✅ 识别结果：")
+        for word in extract_words(result):
+            print(word)
+
+        print("\n✅ 识别结果（含置信度）：")
+        for word, prob in extract_words_with_prob(result):
+            print(f"{word} ({prob:.4f})")
+
+        print("\n✅ 高置信度结果（>0.9）：")
+        high_confidence = filter_by_prob(result, threshold=0.9)
+        for item in high_confidence:
+            print(f"{item['word']} ({item['prob']:.4f})")
+    else:
+        print("❌ 未识别出任何内容，请检查图片或网络连接。")

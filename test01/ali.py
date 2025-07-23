@@ -1,138 +1,134 @@
-import base64
+# -*- coding: utf-8 -*-
+
 import json
+import base64
 import os
 import ssl
-import requests
 import pandas as pd
+import pprint
 
-# 忽略 SSL 证书验证（用于测试环境）
-ssl._create_default_https_context = ssl._create_unverified_context
+try:
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+except ImportError:
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
 
-# API 配置
-REQUEST_URL = "https://tysbgpu.market.alicloudapi.com/api/predict/ocr_general"
-APPCODE = "e092e15c54924d47986e9f1f09e8d08e"
-APP_KEY = "204920110"
-APP_SECRET = "xAH7EMiguRN4io29tc9E38C0RUNYfrf0"
+context = ssl._create_unverified_context()
 
-# 图片路径（支持本地路径或 URL）
-IMAGE_PATH = "t1.jpg"  # 替换为你的图片路径
 
-def image_to_base64(img_path):
-    with open(img_path, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-    return encoded_string
-
-def send_ocr_request():
-    """发送 OCR 请求并返回结构化识别结果"""
-    image_data = image_to_base64(IMAGE_PATH)
-
-    headers = {
-        "Authorization": "APPCODE " + APPCODE,
-        "Content-Type": "application/json",
-        "X-Ca-Key": APP_KEY,
-        "X-Ca-Secret": APP_SECRET,
-    }
-
-    payload = {
-        "image": image_data,
-        "configure": {
-            "min_size": 16,
-            "output_prob": True,
-            "output_keypoints": True,
-            "skip_detection": False,
-            "without_predicting_direction": False,
-        }
-    }
-
+def get_img(img_file):
+    """将本地图片转成base64编码的字符串，或者直接返回图片链接"""
+    # 简单判断是否为图片链接
+    if img_file.startswith("http"):
+        return img_file
+    else:
+        with open(os.path.expanduser(img_file), 'rb') as f:  # 以二进制读取本地图片
+            data = f.read()
     try:
-        response = requests.post(REQUEST_URL, headers=headers, data=json.dumps(payload))
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("success"):
-                return data.get("ret", [])
-            else:
-                print("API 返回失败，错误信息：", data)
-                return []
-        else:
-            print("请求失败，状态码：", response.status_code)
-            print("错误信息：", response.text)
-            return []
-    except Exception as e:
-        print("请求异常：", e)
-        return []
+        encodestr = str(base64.b64encode(data), 'utf-8')
+    except TypeError:
+        encodestr = base64.b64encode(data)
+
+    return encodestr
+
+
+def posturl(headers, body):
+    """发送请求，获取识别结果"""
+    try:
+        params = json.dumps(body).encode(encoding='UTF8')
+        req = Request(REQUEST_URL, params, headers)
+        r = urlopen(req, context=context)
+        html = r.read()
+        return html.decode("utf8")
+    except HTTPError as e:
+        print(e.code)
+        print(e.read().decode("utf8"))
+
+
+def request(appcode, img_file, params):
+    # 请求参数
+    if params is None:
+        params = {}
+    img = get_img(img_file)
+    if img.startswith('http'):  # img 表示图片链接
+        params.update({'url': img})
+    else:  # img 表示图片base64
+        params.update({'img': img})
+
+    # 请求头
+    headers = {
+        'Authorization': 'APPCODE %s' % appcode,
+        'Content-Type': 'application/json; charset=UTF-8'
+    }
+
+    response = posturl(headers, params)
+    return json.loads(response)
+
+
+# 请求接口
+REQUEST_URL = "https://gjbsb.market.alicloudapi.com/ocrservice/advanced"
+
+# 配置信息
+APPCODE = "e092e15c54924d47986e9f1f09e8d08e"
+IMAGE_PATH = "t1.jpg"  # 替换为你的图片路径
+params = {
+    "prob": False,
+    "charInfo": False,
+    "rotate": False,
+    "table": True,  # 启用表格识别功能
+    "sortPage": False,
+    "noStamp": False,
+    "figure": False,
+    "row": False,
+    "paragraph": False,
+    "oricoord": True
+}
+
+result = request(APPCODE, IMAGE_PATH, params)
+
 
 def extract_table_structure(ocr_result):
     """提取表格结构"""
     table_data = []
 
-    for item in ocr_result:
-        word = item.get("word", "")
-        rect = item.get("rect", {})
-        table_data.append({
-            "text": word,
-            "left": rect.get("left", 0),
-            "top": rect.get("top", 0),
-            "width": rect.get("width", 0),
-            "height": rect.get("height", 0)
-        })
+    # 检查是否有 prism_tablesInfo 字段
+    if "prism_tablesInfo" in ocr_result and ocr_result["prism_tablesInfo"]:
+        # 直接从 cellInfos 提取数据，按行组织
+        cell_infos = ocr_result["prism_tablesInfo"][0]["cellInfos"]
+
+        # 按照行列坐标组织数据
+        rows_data = {}
+        for cell in cell_infos:
+            row_idx = cell.get("ysc", 0)
+            col_idx = cell.get("xsc", 0)
+            text = cell.get("word", "")
+
+            if row_idx not in rows_data:
+                rows_data[row_idx] = {}
+            rows_data[row_idx][col_idx] = text
+
+        # 转换为有序列表
+        if rows_data:
+            max_row = max(rows_data.keys())
+            max_col = max(max(row.keys()) if row else 0 for row in rows_data.values())
+
+            for row_idx in range(max_row + 1):
+                row_data = []
+                for col_idx in range(max_col + 1):
+                    row_data.append(rows_data.get(row_idx, {}).get(col_idx, ""))
+                table_data.append(row_data)
 
     return table_data
 
-def group_by_row(table_data, y_threshold=15):
-    """根据 top 坐标对文字块进行分行分组"""
-    sorted_data = sorted(table_data, key=lambda x: (x["top"], x["left"]))
-
-    rows = []
-    current_row = []
-    last_top = None
-
-    for item in sorted_data:
-        current_top = item["top"]
-
-        if last_top is None or abs(current_top - last_top) <= y_threshold:
-            current_row.append(item)
-        else:
-            rows.append(current_row)
-            current_row = [item]
-
-        last_top = current_top
-
-    if current_row:
-        rows.append(current_row)
-
-    return rows
-
-def format_row(row):
-    """格式化一行中的多个文字块"""
-    sorted_row = sorted(row, key=lambda x: x["left"])
-    return " ".join([item["text"] for item in sorted_row])
-
-def format_table(rows):
-    """格式化整个表格"""
-    formatted_rows = [format_row(row) for row in rows]
-    return "\n".join(formatted_rows)
 
 def create_dataframe(table_data):
     """创建 DataFrame 来表示表格"""
-    rows = group_by_row(table_data)
-    data = []
-
-    for row in rows:
-        formatted_row = format_row(row)
-        data.append(formatted_row.split())
-
-    # 确保每行具有相同的列数
-    max_cols = max(len(row) for row in data)
-    for row in data:
-        while len(row) < max_cols:
-            row.append("")
-
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(table_data)
     return df
 
-if __name__ == "__main__":
-    result = send_ocr_request()
 
+if __name__ == "__main__":
     if result:
         print("📄 OCR 识别结果（简洁美观输出）")
         print("──────────────────────────────────────")
@@ -142,7 +138,7 @@ if __name__ == "__main__":
 
         # 打印 DataFrame
         print(df.to_string(index=False, header=False))
-
+        #pprint.pprint(result)
         print("──────────────────────────────────────")
 
         # 保存为文件

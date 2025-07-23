@@ -5,7 +5,7 @@ from PIL import Image
 pytesseract.pytesseract.tesseract_cmd = r'E:\software\Tesseract-OCR\tesseract.exe'  # 根据实际情况修改路径
 
 # 打开图片文件
-image = Image.open('wf.jpg')
+image = Image.open('wf2.jpg')
 
 # 使用 pytesseract 进行 OCR
 text = pytesseract.image_to_string(image, lang='chi_sim')  # 'chi_sim' 表示使用简体中文模型

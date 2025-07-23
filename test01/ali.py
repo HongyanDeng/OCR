@@ -3,11 +3,12 @@ import pandas as pd
 import os
 import paddle
 from PIL import Image
+import json
 
 # 检查是否使用 GPU
 print(paddle.is_compiled_with_cuda())  # 应输出 True
 
-# 初始化 PPStructureV3（用于结构化识别）
+# 初始化 PPStructureV3（使用最基本配置）
 ocr = PPStructureV3(
     use_textline_orientation=True  # 是否启用文本行方向识别
 )
@@ -21,51 +22,87 @@ print("图片尺寸:", img.size)
 # 使用 predict 方法进行识别
 result = ocr.predict(image_path)
 
-# 提取文本内容
-text_result = []
-for res in result:
-    if isinstance(res, dict) and 'overall_ocr_res' in res:
-        ocr_res = res['overall_ocr_res']
-        if 'rec_texts' in ocr_res:
-            text_result.extend(ocr_res['rec_texts'])
+# 打印完整结果结构（用于调试）
+print("识别结果结构:")
+print(json.dumps(result, default=str, indent=2)[:2000] + "...")  # 打印更多内容用于分析
 
-# 如果提取到文本内容
-if text_result:
-    print(" 识别到文本内容：")
-    for text in text_result:
-        print(text)
+# 尝试从结果中提取表格结构信息
+table_data = []
 
-    # 保存原始文本到文件
-    with open("ocr_result_paddle.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(text_result))
-    print(" 普通文本识别结果已保存至 ocr_result_paddle.txt")
+print("\n=== 分析识别结果 ===")
 
-    # 自动组织成表格结构
-    # 假设前4个元素是表头（日期、上午、下午、晚上）
-    if len(text_result) >= 4:
-        # 表头
-        headers = text_result[:4]
+# 遍历结果寻找 table_res_list
+for i, res in enumerate(result):
+    print(f"\n结果项 {i} 类型: {type(res)}")
+    if isinstance(res, dict):
+        print(f"键值: {list(res.keys())}")
 
-        # 数据行（跳过表头，每4个元素为一行）
-        data_rows = []
-        for i in range(4, len(text_result), 4):
-            row = text_result[i:i + 4]
-            # 如果最后一行不足4列，用空字符串填充
-            while len(row) < 4:
-                row.append("")
-            data_rows.append(row)
+        # 检查是否有 table_res_list
+        if 'table_res_list' in res and res['table_res_list']:
+            print("✅ 检测到 table_res_list，尝试提取表格结构信息...")
 
-        # 创建 DataFrame
-        df = pd.DataFrame(data_rows, columns=headers)
+            table_res_list = res['table_res_list']
+            for table_res in table_res_list:
+                if 'cell_content_list' in table_res and 'cell_box_list' in table_res:
+                    cell_contents = table_res['cell_content_list']
+                    cell_boxes = table_res['cell_box_list']
 
-        # 打印表格
-        print("\n 自动整理的表格识别结果：")
-        print(df.to_string(index=False))
 
-        # 保存为 CSV
-        df.to_csv("ocr_result_paddle.csv", index=False, encoding="utf-8-sig")
-        print(" 表格识别结果已保存至 ocr_result_paddle.csv")
-    else:
-        print(" 文本内容不足以构成表格结构")
-else:
-    print(" 未提取到任何文本内容")
+                    print("cell_contents 数量：", len(cell_contents))
+                    print("cell_boxes 数量：", len(cell_boxes))
+                    print("前5个 cell_contents：", cell_contents[:5])
+                    print("前5个 cell_boxes：", cell_boxes[:5])
+
+                    print(f"检测到 {len(cell_contents)} 个单元格")
+
+                    if len(cell_contents) == 0 or len(cell_boxes) == 0:
+                        print("❌ 单元格内容或坐标为空")
+                        continue
+
+                    if len(cell_contents) != len(cell_boxes):
+                        print("⚠️ 单元格内容和坐标数量不一致，尝试修复...")
+
+                        # 修复：取较小的数量
+                        min_len = min(len(cell_contents), len(cell_boxes))
+                        cell_contents = cell_contents[:min_len]
+                        cell_boxes = cell_boxes[:min_len]
+
+                    # 尝试根据 cell_boxes 排序并重建表格行
+                    # 根据单元格的 y 坐标对单元格进行排序
+                    sorted_cells = sorted(
+                        zip(cell_contents, cell_boxes),
+                        key=lambda x: x[1][0][1]  # 按第一个点的 y 坐标排序
+                    )
+
+                    # 根据 x 坐标分组为行
+                    rows = []
+                    current_row = []
+                    prev_y = None
+                    row_threshold = 20  # 同一行的 y 差阈值
+
+                    for content, box in sorted_cells:
+                        current_y = box[0][1]
+                        if prev_y is None or abs(current_y - prev_y) < row_threshold:
+                            current_row.append(content)
+                        else:
+                            rows.append(current_row)
+                            current_row = [content]
+                        prev_y = current_y
+
+                    if current_row:
+                        print("当前构建行：", current_row)
+
+                        rows.append(current_row)
+
+                    # 构建 DataFrame
+                    if rows:
+                        print("\n📄 成功从结构信息重建表格：")
+                        df = pd.DataFrame(rows)
+                        print(df.to_string(index=False, header=False))
+
+                        df.to_csv("ocr_structured_table.csv", index=False, encoding="utf-8-sig", header=False)
+                        print("✅ 表格已保存至 ocr_structured_table.csv")
+
+
+                    else:
+                        print("❌ 无法构建表格：无有效行")

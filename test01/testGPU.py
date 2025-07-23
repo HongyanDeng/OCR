@@ -1,4 +1,6 @@
 import paddle
+import paddleocr
+print(paddleocr.__version__)
 
 
 print(paddle.__version__)          # 应输出 3.1.0

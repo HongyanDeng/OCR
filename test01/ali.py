@@ -1,108 +1,83 @@
-from paddleocr import PPStructureV3
-import pandas as pd
-import os
-import paddle
-from PIL import Image
 import json
+import numpy as np
+import pandas as pd
 
-# 检查是否使用 GPU
-print(paddle.is_compiled_with_cuda())  # 应输出 True
+def parse_poly_str(poly_str):
+    """
+    把类似 "[[106  57]\n ...\n [106  88]]" 形式的字符串解析成4个点的坐标列表[[x,y],...]
+    """
+    # 去除多余字符，只留下数字和空格
+    lines = poly_str.strip().replace('[','').replace(']','').split('\n')
+    points = []
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) == 2:
+            x, y = map(int, parts)
+            points.append([x,y])
+    return points
 
-# 初始化 PPStructureV3（使用最基本配置）
-ocr = PPStructureV3(
-    use_textline_orientation=True  # 是否启用文本行方向识别
-)
+def cluster_rows(boxes, threshold=15):
+    """
+    根据每个文字框左上点的y坐标聚类成行
+    boxes格式：List[List[x,y,...]] 4个顶点坐标
+    返回：List[List[int]] 每个子list是同一行的索引
+    """
+    y_coords = [box[0][1] for box in boxes]  # 取左上角点的y
+    sorted_idx = np.argsort(y_coords)
+    rows = []
+    current_row = []
+    last_y = None
+    for idx in sorted_idx:
+        y = y_coords[idx]
+        if last_y is None or abs(y - last_y) <= threshold:
+            current_row.append(idx)
+        else:
+            rows.append(current_row)
+            current_row = [idx]
+        last_y = y
+    if current_row:
+        rows.append(current_row)
+    return rows
 
-# 图片路径
-image_path = "t.jpg"
-print(os.path.exists(image_path))  # 应输出 True
-img = Image.open(image_path)
-print("图片尺寸:", img.size)
+def reconstruct_table(rec_texts, dt_polys):
+    # 解析字符串坐标为数字坐标
+    boxes = [parse_poly_str(p) for p in dt_polys]
 
-# 使用 predict 方法进行识别
-result = ocr.predict(image_path)
+    # 行聚类
+    rows_indices = cluster_rows(boxes, threshold=15)
 
-# 打印完整结果结构（用于调试）
-print("识别结果结构:")
-print(json.dumps(result, default=str, indent=2)[:2000] + "...")  # 打印更多内容用于分析
+    # 组装行文本（行内根据左上点x排序）
+    rows = []
+    for row in rows_indices:
+        # 行内排序
+        row_sorted = sorted(row, key=lambda i: boxes[i][0][0])
+        row_texts = [rec_texts[i] for i in row_sorted]
+        rows.append(row_texts)
 
-# 尝试从结果中提取表格结构信息
-table_data = []
+    # 转成DataFrame
+    df = pd.DataFrame(rows)
+    return df
 
-print("\n=== 分析识别结果 ===")
+def main():
+    # 读取 OCR 结果 JSON
+    with open("raw_table_output.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-# 遍历结果寻找 table_res_list
-for i, res in enumerate(result):
-    print(f"\n结果项 {i} 类型: {type(res)}")
-    if isinstance(res, dict):
-        print(f"键值: {list(res.keys())}")
+    # 你的 OCR 结果在列表第一项的 overall_ocr_res 下
+    overall_ocr_res = data[0]['overall_ocr_res']
 
-        # 检查是否有 table_res_list
-        if 'table_res_list' in res and res['table_res_list']:
-            print("✅ 检测到 table_res_list，尝试提取表格结构信息...")
+    rec_texts = overall_ocr_res['rec_texts']
+    dt_polys = overall_ocr_res['dt_polys']
 
-            table_res_list = res['table_res_list']
-            for table_res in table_res_list:
-                if 'cell_content_list' in table_res and 'cell_box_list' in table_res:
-                    cell_contents = table_res['cell_content_list']
-                    cell_boxes = table_res['cell_box_list']
+    # 重建表格
+    df = reconstruct_table(rec_texts, dt_polys)
 
+    print("简易表格重建结果预览：")
+    print(df)
 
-                    print("cell_contents 数量：", len(cell_contents))
-                    print("cell_boxes 数量：", len(cell_boxes))
-                    print("前5个 cell_contents：", cell_contents[:5])
-                    print("前5个 cell_boxes：", cell_boxes[:5])
+    # 保存
+    df.to_csv("simple_reconstructed_table.csv", index=False, encoding="utf-8-sig")
+    print("✅ 简易表格已保存到 simple_reconstructed_table.csv")
 
-                    print(f"检测到 {len(cell_contents)} 个单元格")
-
-                    if len(cell_contents) == 0 or len(cell_boxes) == 0:
-                        print("❌ 单元格内容或坐标为空")
-                        continue
-
-                    if len(cell_contents) != len(cell_boxes):
-                        print("⚠️ 单元格内容和坐标数量不一致，尝试修复...")
-
-                        # 修复：取较小的数量
-                        min_len = min(len(cell_contents), len(cell_boxes))
-                        cell_contents = cell_contents[:min_len]
-                        cell_boxes = cell_boxes[:min_len]
-
-                    # 尝试根据 cell_boxes 排序并重建表格行
-                    # 根据单元格的 y 坐标对单元格进行排序
-                    sorted_cells = sorted(
-                        zip(cell_contents, cell_boxes),
-                        key=lambda x: x[1][0][1]  # 按第一个点的 y 坐标排序
-                    )
-
-                    # 根据 x 坐标分组为行
-                    rows = []
-                    current_row = []
-                    prev_y = None
-                    row_threshold = 20  # 同一行的 y 差阈值
-
-                    for content, box in sorted_cells:
-                        current_y = box[0][1]
-                        if prev_y is None or abs(current_y - prev_y) < row_threshold:
-                            current_row.append(content)
-                        else:
-                            rows.append(current_row)
-                            current_row = [content]
-                        prev_y = current_y
-
-                    if current_row:
-                        print("当前构建行：", current_row)
-
-                        rows.append(current_row)
-
-                    # 构建 DataFrame
-                    if rows:
-                        print("\n📄 成功从结构信息重建表格：")
-                        df = pd.DataFrame(rows)
-                        print(df.to_string(index=False, header=False))
-
-                        df.to_csv("ocr_structured_table.csv", index=False, encoding="utf-8-sig", header=False)
-                        print("✅ 表格已保存至 ocr_structured_table.csv")
-
-
-                    else:
-                        print("❌ 无法构建表格：无有效行")
+if __name__ == "__main__":
+    main()

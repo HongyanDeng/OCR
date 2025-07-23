@@ -1,148 +1,71 @@
-# -*- coding: utf-8 -*-
-
-import json
-import base64
-import os
-import ssl
+from paddleocr import PaddleOCR
 import pandas as pd
-import pprint
+from bs4 import BeautifulSoup
+import os
+import paddle
+from PIL import Image
 
-try:
-    from urllib.error import HTTPError
-    from urllib.request import Request, urlopen
-except ImportError:
-    from urllib.request import Request, urlopen
-    from urllib.error import HTTPError
+# 检查是否使用 GPU
+print(paddle.is_compiled_with_cuda())  # 应输出 True
 
-context = ssl._create_unverified_context()
+# 初始化 PaddleOCR
+ocr = PaddleOCR(
+    use_textline_orientation=True,
+    lang='ch'
+)
 
+# 图片路径
+image_path = "t1.jpg"
+print(os.path.exists(image_path))  # 应输出 True
+img = Image.open(image_path)
+img.show()  # 查看图片是否正常
 
-def get_img(img_file):
-    """将本地图片转成base64编码的字符串，或者直接返回图片链接"""
-    # 简单判断是否为图片链接
-    if img_file.startswith("http"):
-        return img_file
-    else:
-        with open(os.path.expanduser(img_file), 'rb') as f:  # 以二进制读取本地图片
-            data = f.read()
-    try:
-        encodestr = str(base64.b64encode(data), 'utf-8')
-    except TypeError:
-        encodestr = base64.b64encode(data)
+# 使用 predict 方法进行识别
+result = ocr.predict(image_path)
 
-    return encodestr
+# 提取表格 HTML（如果识别到表格）
+table_html = ""
+for line in result:
+    if isinstance(line, dict) and 'html' in line:
+        table_html = line['html']
+        break
 
+# 如果识别到表格，解析 HTML 并转换为 DataFrame
+if table_html:
+    print("✅ 识别到表格")
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(table_html, 'html.parser')
+    table = soup.find('table')
+    rows = table.find_all('tr')
 
-def posturl(headers, body):
-    """发送请求，获取识别结果"""
-    try:
-        params = json.dumps(body).encode(encoding='UTF8')
-        req = Request(REQUEST_URL, params, headers)
-        r = urlopen(req, context=context)
-        html = r.read()
-        return html.decode("utf8")
-    except HTTPError as e:
-        print(e.code)
-        print(e.read().decode("utf8"))
-
-
-def request(appcode, img_file, params):
-    # 请求参数
-    if params is None:
-        params = {}
-    img = get_img(img_file)
-    if img.startswith('http'):  # img 表示图片链接
-        params.update({'url': img})
-    else:  # img 表示图片base64
-        params.update({'img': img})
-
-    # 请求头
-    headers = {
-        'Authorization': 'APPCODE %s' % appcode,
-        'Content-Type': 'application/json; charset=UTF-8'
-    }
-
-    response = posturl(headers, params)
-    return json.loads(response)
-
-
-# 请求接口
-REQUEST_URL = "https://gjbsb.market.alicloudapi.com/ocrservice/advanced"
-
-# 配置信息
-APPCODE = "e092e15c54924d47986e9f1f09e8d08e"
-IMAGE_PATH = "t1.jpg"  # 替换为你的图片路径
-params = {
-    "prob": False,
-    "charInfo": False,
-    "rotate": False,
-    "table": True,  # 启用表格识别功能
-    "sortPage": False,
-    "noStamp": False,
-    "figure": False,
-    "row": False,
-    "paragraph": False,
-    "oricoord": True
-}
-
-result = request(APPCODE, IMAGE_PATH, params)
-
-
-def extract_table_structure(ocr_result):
-    """提取表格结构"""
     table_data = []
+    for row in rows:
+        cols = row.find_all(['td', 'th'])
+        cols = [col.get_text(strip=True) for col in cols]
+        table_data.append(cols)
 
-    # 检查是否有 prism_tablesInfo 字段
-    if "prism_tablesInfo" in ocr_result and ocr_result["prism_tablesInfo"]:
-        # 直接从 cellInfos 提取数据，按行组织
-        cell_infos = ocr_result["prism_tablesInfo"][0]["cellInfos"]
+    # 转换为 DataFrame
+    df = pd.DataFrame(table_data[1:], columns=table_data[0])
 
-        # 按照行列坐标组织数据
-        rows_data = {}
-        for cell in cell_infos:
-            row_idx = cell.get("ysc", 0)
-            col_idx = cell.get("xsc", 0)
-            text = cell.get("word", "")
+    # 打印并保存结果
+    print("📄 表格识别结果：")
+    print(df.to_string(index=False))
+    df.to_csv("ocr_result_paddle.csv", index=False, encoding="utf-8-sig")
+    print("✅ 表格识别结果已保存至 ocr_result_paddle.csv")
+else:
+    print("⚠️ 未识别到表格，尝试提取普通文本")
+    # 从 result 中提取 rec_texts
+    text_result = []
+    for line in result:
+        if isinstance(line, dict) and 'rec_texts' in line:
+            text_result = line['rec_texts']
+            break
 
-            if row_idx not in rows_data:
-                rows_data[row_idx] = {}
-            rows_data[row_idx][col_idx] = text
-
-        # 转换为有序列表
-        if rows_data:
-            max_row = max(rows_data.keys())
-            max_col = max(max(row.keys()) if row else 0 for row in rows_data.values())
-
-            for row_idx in range(max_row + 1):
-                row_data = []
-                for col_idx in range(max_col + 1):
-                    row_data.append(rows_data.get(row_idx, {}).get(col_idx, ""))
-                table_data.append(row_data)
-
-    return table_data
-
-
-def create_dataframe(table_data):
-    """创建 DataFrame 来表示表格"""
-    df = pd.DataFrame(table_data)
-    return df
-
-
-if __name__ == "__main__":
-    if result:
-        print("📄 OCR 识别结果（简洁美观输出）")
-        print("──────────────────────────────────────")
-
-        table_data = extract_table_structure(result)
-        df = create_dataframe(table_data)
-
-        # 打印 DataFrame
-        print(df.to_string(index=False, header=False))
-        #pprint.pprint(result)
-        print("──────────────────────────────────────")
-
-        # 保存为文件
-        df.to_csv("ocr_result_clean.csv", index=False, header=False, encoding="utf-8-sig")
-        print("✅ 识别结果（简洁输出）已保存至 ocr_result_clean.csv")
+    if text_result:
+        for text in text_result:
+            print(text)
+        with open("ocr_result_paddle.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(text_result))
+        print("✅ 普通文本识别结果已保存至 ocr_result_paddle.txt")
     else:
-        print("❌ 未识别出任何内容，请检查图片或网络连接。")
+        print("❌ 未提取到任何文本内容")

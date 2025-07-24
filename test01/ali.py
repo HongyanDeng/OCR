@@ -5,6 +5,7 @@ from PIL import Image
 import json
 import pandas as pd
 import numpy as np
+import time  # 新增时间模块
 
 
 class TableOCRProcessor:
@@ -15,7 +16,6 @@ class TableOCRProcessor:
 
     def _init_paddle(self):
         """配置PaddlePaddle的GPU优化参数"""
-        # 检查GPU是否可用
         if paddle.is_compiled_with_cuda():
             paddle.set_device('gpu')
             print("已启用GPU加速")
@@ -25,14 +25,12 @@ class TableOCRProcessor:
 
     def _init_model(self):
         """初始化PPStructureV3模型"""
-        # PPStructureV3 最新版本不需要参数
         return PPStructureV3()
 
     def print_gpu_status(self):
         """打印GPU状态"""
         if paddle.is_compiled_with_cuda():
             try:
-                # 新版本PaddlePaddle获取显存信息的方式
                 alloc_mem = paddle.device.cuda.max_memory_allocated() / 1024 ** 2
                 total_mem = paddle.device.cuda.get_device_properties().total_memory / 1024 ** 2
                 print(f"GPU内存使用: {alloc_mem:.2f}MB / {total_mem:.2f}MB")
@@ -74,61 +72,45 @@ class TableOCRProcessor:
 
     @staticmethod
     def parse_poly_str(poly_str):
-        """
-        优化后的坐标解析函数，使用numpy向量化操作
-        把类似 "[[106  57]\n ...\n [106  88]]" 形式的字符串解析成4个点的坐标列表[[x,y],...]
-        """
-        # 移除所有非数字字符，只保留空格和数字
+        """坐标解析函数"""
         cleaned = ''.join(c if c.isdigit() or c.isspace() else ' ' for c in poly_str)
-        # 直接转换为numpy数组
         points = np.fromstring(cleaned, sep=' ', dtype=int).reshape(-1, 2)
         return points.tolist()
 
     @staticmethod
     def cluster_rows(boxes, threshold=15):
-        """
-        根据每个文字框左上点的y坐标聚类成行(优化版)
-        boxes格式：List[List[x,y,...]] 4个顶点坐标
-        返回：List[List[int]] 每个子list是同一行的索引
-        """
+        """行聚类"""
         top_lefts = np.array([box[0] for box in boxes])
         y_coords = top_lefts[:, 1]
         sorted_idx = np.argsort(y_coords)
         diffs = np.diff(y_coords[sorted_idx])
-
-        # 使用numpy寻找分割点
         split_points = np.where(diffs > threshold)[0] + 1
         rows_indices = np.split(sorted_idx, split_points)
         return [row.tolist() for row in rows_indices]
 
     def reconstruct_table(self, rec_texts, dt_polys):
-        """重建表格数据结构(优化版)"""
-        # 解析字符串坐标为数字坐标
+        """重建表格"""
         boxes = [self.parse_poly_str(p) for p in dt_polys]
-
-        # 行聚类
         rows_indices = self.cluster_rows(boxes, threshold=15)
-
-        # 获取所有左上角点坐标用于排序
         top_lefts = np.array([box[0] for box in boxes])
 
-        # 组装行文本（行内根据左上点x排序）
         rows = []
         for row in rows_indices:
-            # 行内按x坐标排序
             row_sorted = sorted(row, key=lambda i: top_lefts[i, 0])
             row_texts = [rec_texts[i] for i in row_sorted]
             rows.append(row_texts)
 
-        # 转成DataFrame并处理不等长行
         max_cols = max(len(row) for row in rows)
         padded_rows = [row + [''] * (max_cols - len(row)) for row in rows]
         return pd.DataFrame(padded_rows)
 
 
 def main():
+    # 记录开始时间
+    start_time = time.time()
+
     # 处理实际图像
-    image_path = "t.jpg"
+    image_path = "wf.jpg"
     if not os.path.exists(image_path):
         print(f"❌ 图片文件不存在: {image_path}")
         return
@@ -136,7 +118,7 @@ def main():
     # 初始化处理器
     processor = TableOCRProcessor()
 
-    # 运行结构化识别，保存结果json
+    # 运行结构化识别
     try:
         json_path = processor.run_structure_ocr(image_path)
     except Exception as e:
@@ -147,7 +129,7 @@ def main():
         print(f"❌ 识别结果文件未生成: {json_path}")
         return
 
-    # 读取识别结果json
+    # 读取识别结果
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -168,7 +150,7 @@ def main():
         print("❌ 文本与坐标数量不匹配或为空")
         return
 
-    # 重建简易表格
+    # 重建表格
     df = processor.reconstruct_table(rec_texts, dt_polys)
 
     print("\n📄 简易表格重建结果预览：")
@@ -178,9 +160,13 @@ def main():
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     print(f"✅ 简易表格已保存到: {csv_path}")
 
+    # 计算并打印总运行时间
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"\n⏱️ 总运行时间: {total_time:.2f}秒")
+
 
 if __name__ == "__main__":
-    # 设置PaddlePaddle默认精度(如果支持)
     try:
         paddle.set_default_dtype('float16')
         print("已启用float16精度模式")

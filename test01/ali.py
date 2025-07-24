@@ -7,12 +7,12 @@ import pandas as pd
 import numpy as np
 import time
 import psutil
-from typing import List
+from typing import List, Union
 
 
 class TableOCRProcessor:
     def __init__(self):
-        """初始化OCR处理器（单例模式）"""
+        """初始化OCR处理器"""
         self._print_system_info()
         self._init_paddle()
         self.model = self._init_model()
@@ -49,7 +49,7 @@ class TableOCRProcessor:
         print("\n🔥 模型初始化中...")
         start_time = time.time()
 
-        model = PPStructureV3()  # 不传递参数避免兼容性问题
+        model = PPStructureV3()
 
         # 小型预热
         try:
@@ -62,12 +62,7 @@ class TableOCRProcessor:
         return model
 
     def preprocess_image(self, image_path: str, max_size: int = 1200) -> Image.Image:
-        """
-        图像预处理（自动处理RGBA格式和缩放）
-        :param image_path: 图片路径
-        :param max_size: 最大边长像素
-        :return: PIL.Image对象
-        """
+        """图像预处理"""
         print(f"\n🖼️ 预处理图片: {os.path.basename(image_path)}")
         try:
             img = Image.open(image_path)
@@ -88,12 +83,7 @@ class TableOCRProcessor:
             raise
 
     def process_single_image(self, image_path: str, output_dir: str = "output") -> dict:
-        """
-        处理单张图片并保存结果
-        :param image_path: 图片路径
-        :param output_dir: 输出目录
-        :return: 包含结果路径的字典
-        """
+        """处理单张图片"""
         result_info = {
             "image": os.path.basename(image_path),
             "json_path": None,
@@ -122,35 +112,44 @@ class TableOCRProcessor:
                 json.dump(result, f, ensure_ascii=False, indent=2, default=str)
             result_info["json_path"] = json_path
 
-            # 4. 提取表格数据
+            # 4. 提取表格数据（修复了类型错误）
             if result and isinstance(result, list):
-                overall_ocr_res = result[0].get('overall_ocr_res', {})
-                rec_texts = overall_ocr_res.get('rec_texts', [])
-                dt_polys = overall_ocr_res.get('dt_polys', [])
+                for page in result:
+                    if 'overall_ocr_res' in page:
+                        ocr_res = page['overall_ocr_res']
+                        rec_texts = ocr_res.get('rec_texts', [])
+                        dt_polys = ocr_res.get('dt_polys', [])
 
-                if len(rec_texts) == len(dt_polys):
-                    df = self._reconstruct_table(rec_texts, dt_polys)
-                    csv_path = os.path.join(output_dir, f"{base_name}_table.csv")
-                    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-                    result_info["csv_path"] = csv_path
-                    print(f"📊 表格已保存: {csv_path}")
+                        # 确保坐标是可用格式
+                        if len(rec_texts) == len(dt_polys):
+                            df = self._reconstruct_table(rec_texts, dt_polys)
+                            csv_path = os.path.join(output_dir, f"{base_name}_table.csv")
+                            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                            result_info["csv_path"] = csv_path
+                            print(f"📊 表格已保存: {csv_path}")
+                            result_info["success"] = True
 
-            result_info["success"] = True
             return result_info
 
         except Exception as e:
             print(f"❌ 处理失败: {base_name} - {str(e)}")
             return result_info
         finally:
-            # 清理临时文件
             if 'temp_img_path' in locals() and os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
-            if paddle.is_compiled_with_cuda():
-                paddle.device.cuda.empty_cache()
+            paddle.device.cuda.empty_cache()
 
-    def _reconstruct_table(self, rec_texts: List[str], dt_polys: List[str]) -> pd.DataFrame:
-        """重建表格数据结构"""
-        boxes = [self._parse_poly_str(p) for p in dt_polys]
+    def _reconstruct_table(self, rec_texts: List[str], dt_polys: List[Union[str, np.ndarray]]) -> pd.DataFrame:
+        """重建表格（兼容字符串和numpy数组输入）"""
+        boxes = []
+        for poly in dt_polys:
+            if isinstance(poly, np.ndarray):
+                boxes.append(poly.tolist())
+            elif isinstance(poly, str):
+                boxes.append(self._parse_poly_str(poly))
+            else:
+                boxes.append(self._parse_poly_str(str(poly)))
+
         rows_indices = self._cluster_rows(boxes)
         top_lefts = np.array([box[0] for box in boxes])
 
@@ -180,12 +179,8 @@ class TableOCRProcessor:
         return np.split(sorted_idx, split_points)
 
 
-def batch_process_images(image_paths: List[str], output_dir: str = "output"):
-    """
-    批量处理图片
-    :param image_paths: 图片路径列表
-    :param output_dir: 输出目录
-    """
+def batch_process_images(image_paths: List[str], output_dir: str = "ocr_results"):
+    """批量处理图片"""
     print("\n" + "=" * 50)
     print(f"🛠️ 开始批量处理 {len(image_paths)} 张图片")
     print("=" * 50)
@@ -246,11 +241,11 @@ if __name__ == "__main__":
         print("\n🔽 当前环境不支持float16，使用默认精度")
 
     # 要处理的图片列表
-    image_files = ["t.jpg", "wf.jpg"]  # 添加更多图片路径
+    image_files = ["t.jpg", "wf.jpg"]
 
     # 过滤出实际存在的文件
     valid_images = [img for img in image_files if os.path.exists(img)]
     if not valid_images:
         print("\n❌ 没有找到可处理的图片文件")
     else:
-        batch_process_images(valid_images, output_dir="ocr_results")
+        batch_process_images(valid_images)

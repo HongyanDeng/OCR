@@ -1,12 +1,29 @@
+import os
+import paddle
+from paddleocr import PPStructureV3
+from PIL import Image
 import json
-import numpy as np
 import pandas as pd
+import numpy as np
+
+def run_structure_ocr(image_path):
+    print("当前工作目录:", os.getcwd())
+    print("是否使用GPU:", paddle.is_compiled_with_cuda())
+
+    ocr = PPStructureV3(use_textline_orientation=True)
+    print(f"开始结构化识别图片: {image_path}")
+    result = ocr.predict(image_path)
+
+    output_json_path = "raw_table_output.json"
+    with open(output_json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+    print(f"结构化识别完成，结果已保存: {output_json_path}")
+    return output_json_path
 
 def parse_poly_str(poly_str):
     """
     把类似 "[[106  57]\n ...\n [106  88]]" 形式的字符串解析成4个点的坐标列表[[x,y],...]
     """
-    # 去除多余字符，只留下数字和空格
     lines = poly_str.strip().replace('[','').replace(']','').split('\n')
     points = []
     for line in lines:
@@ -59,25 +76,49 @@ def reconstruct_table(rec_texts, dt_polys):
     return df
 
 def main():
-    # 读取 OCR 结果 JSON
-    with open("raw_table_output.json", "r", encoding="utf-8") as f:
+    image_path = "t.jpg"
+
+    if not os.path.exists(image_path):
+        print(f"❌ 图片文件不存在: {image_path}")
+        return
+
+    # 运行结构化识别，保存结果json
+    json_path = run_structure_ocr(image_path)
+
+    if not os.path.exists(json_path):
+        print(f"❌ 识别结果文件未生成: {json_path}")
+        return
+
+    # 读取识别结果json
+    with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # 你的 OCR 结果在列表第一项的 overall_ocr_res 下
-    overall_ocr_res = data[0]['overall_ocr_res']
+    # data通常是列表，第一项为本页结果
+    if not data or not isinstance(data, list):
+        print("❌ 识别结果格式异常")
+        return
 
-    rec_texts = overall_ocr_res['rec_texts']
-    dt_polys = overall_ocr_res['dt_polys']
+    overall_ocr_res = data[0].get('overall_ocr_res', None)
+    if not overall_ocr_res:
+        print("❌ 未找到 overall_ocr_res 字段")
+        return
 
-    # 重建表格
+    rec_texts = overall_ocr_res.get('rec_texts', [])
+    dt_polys = overall_ocr_res.get('dt_polys', [])
+
+    if not rec_texts or not dt_polys or len(rec_texts) != len(dt_polys):
+        print("❌ 文本与坐标数量不匹配或为空")
+        return
+
+    # 重建简易表格
     df = reconstruct_table(rec_texts, dt_polys)
 
-    print("简易表格重建结果预览：")
+    print("\n📄 简易表格重建结果预览：")
     print(df)
 
-    # 保存
-    df.to_csv("simple_reconstructed_table.csv", index=False, encoding="utf-8-sig")
-    print("✅ 简易表格已保存到 simple_reconstructed_table.csv")
+    csv_path = "simple_reconstructed_table.csv"
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"✅ 简易表格已保存到: {csv_path}")
 
 if __name__ == "__main__":
     main()

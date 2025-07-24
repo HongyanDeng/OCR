@@ -7,11 +7,12 @@ import pandas as pd
 import numpy as np
 import time
 import psutil
+from typing import List
 
 
 class TableOCRProcessor:
     def __init__(self):
-        """初始化OCR处理器"""
+        """初始化OCR处理器（单例模式）"""
         self._print_system_info()
         self._init_paddle()
         self.model = self._init_model()
@@ -34,6 +35,11 @@ class TableOCRProcessor:
         if paddle.is_compiled_with_cuda():
             paddle.set_device('gpu')
             print("\n✅ 已启用GPU加速")
+            paddle.set_flags({
+                'FLAGS_conv_workspace_size_limit': 128,
+                'FLAGS_cudnn_exhaustive_search': 1,
+                'FLAGS_allocator_strategy': 'auto_growth'
+            })
         else:
             paddle.set_device('cpu')
             print("\n⚠️ 未检测到GPU，使用CPU模式")
@@ -43,76 +49,98 @@ class TableOCRProcessor:
         print("\n🔥 模型初始化中...")
         start_time = time.time()
 
-        # 初始化模型（不传递任何参数）
-        model = PPStructureV3()
+        model = PPStructureV3()  # 不传递参数避免兼容性问题
 
         # 小型预热
         try:
             dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
             model.predict(dummy_img)
         except Exception as e:
-            print(f"预热失败: {str(e)}")
+            print(f"预热警告: {str(e)}")
 
         print(f"模型初始化完成，耗时: {time.time() - start_time:.2f}秒")
         return model
 
-    def preprocess_image(self, image_path, max_size=1200):
+    def preprocess_image(self, image_path: str, max_size: int = 1200) -> Image.Image:
         """
-        图像预处理
-        修复RGBA转JPEG问题并优化缩放逻辑
+        图像预处理（自动处理RGBA格式和缩放）
+        :param image_path: 图片路径
+        :param max_size: 最大边长像素
+        :return: PIL.Image对象
         """
-        print("\n🖼️ 图像预处理中...")
+        print(f"\n🖼️ 预处理图片: {os.path.basename(image_path)}")
         try:
             img = Image.open(image_path)
-
-            # 转换RGBA为RGB
             if img.mode == 'RGBA':
                 img = img.convert('RGB')
-                print("已转换RGBA图像为RGB格式")
+                print("  已转换RGBA为RGB格式")
 
             w, h = img.size
             if max(w, h) > max_size:
                 scale = max_size / max(w, h)
                 new_w, new_h = int(w * scale), int(h * scale)
                 img = img.resize((new_w, new_h), Image.LANCZOS)
-                print(f"图像从 ({w},{h}) 缩放至 ({new_w},{new_h})")
+                print(f"  图片从 ({w},{h}) 缩放至 ({new_w},{new_h})")
 
             return img
         except Exception as e:
-            print(f"❌ 图像预处理失败: {str(e)}")
+            print(f"❌ 图片预处理失败: {str(e)}")
             raise
 
-    def run_structure_ocr(self, image_path):
-        """执行OCR识别"""
-        print("\n🔍 OCR识别开始")
-        start_time = time.time()
+    def process_single_image(self, image_path: str, output_dir: str = "output") -> dict:
+        """
+        处理单张图片并保存结果
+        :param image_path: 图片路径
+        :param output_dir: 输出目录
+        :return: 包含结果路径的字典
+        """
+        result_info = {
+            "image": os.path.basename(image_path),
+            "json_path": None,
+            "csv_path": None,
+            "success": False
+        }
+
+        os.makedirs(output_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
 
         try:
-            # 预处理图像
+            # 1. 预处理图像
             img = self.preprocess_image(image_path)
-
-            # 使用临时文件（确保RGB格式）
-            temp_img_path = "temp_preprocessed.jpg"
+            temp_img_path = os.path.join(output_dir, f"temp_{base_name}.jpg")
             img.save(temp_img_path, quality=95, subsampling=0)
 
-            print(f"当前工作目录: {os.getcwd()}")
-            print(f"处理图像尺寸: {img.width}x{img.height}")
-
-            # 执行OCR
+            # 2. 执行OCR
+            print(f"🔍 正在识别: {base_name}")
             ocr_start = time.time()
             result = self.model.predict(temp_img_path)
-            print(f"OCR核心处理耗时: {time.time() - ocr_start:.2f}秒")
+            print(f"  OCR核心耗时: {time.time() - ocr_start:.2f}秒")
 
-            # 保存结果
-            output_json_path = "raw_table_output.json"
-            with open(output_json_path, "w", encoding="utf-8") as f:
+            # 3. 保存JSON结果
+            json_path = os.path.join(output_dir, f"{base_name}_result.json")
+            with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+            result_info["json_path"] = json_path
 
-            print(f"\n✅ OCR识别完成，总耗时: {time.time() - start_time:.2f}秒")
-            return output_json_path
+            # 4. 提取表格数据
+            if result and isinstance(result, list):
+                overall_ocr_res = result[0].get('overall_ocr_res', {})
+                rec_texts = overall_ocr_res.get('rec_texts', [])
+                dt_polys = overall_ocr_res.get('dt_polys', [])
+
+                if len(rec_texts) == len(dt_polys):
+                    df = self._reconstruct_table(rec_texts, dt_polys)
+                    csv_path = os.path.join(output_dir, f"{base_name}_table.csv")
+                    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                    result_info["csv_path"] = csv_path
+                    print(f"📊 表格已保存: {csv_path}")
+
+            result_info["success"] = True
+            return result_info
+
         except Exception as e:
-            print(f"❌ OCR识别失败: {str(e)}")
-            raise
+            print(f"❌ 处理失败: {base_name} - {str(e)}")
+            return result_info
         finally:
             # 清理临时文件
             if 'temp_img_path' in locals() and os.path.exists(temp_img_path):
@@ -120,16 +148,30 @@ class TableOCRProcessor:
             if paddle.is_compiled_with_cuda():
                 paddle.device.cuda.empty_cache()
 
+    def _reconstruct_table(self, rec_texts: List[str], dt_polys: List[str]) -> pd.DataFrame:
+        """重建表格数据结构"""
+        boxes = [self._parse_poly_str(p) for p in dt_polys]
+        rows_indices = self._cluster_rows(boxes)
+        top_lefts = np.array([box[0] for box in boxes])
+
+        rows = []
+        for row in rows_indices:
+            row_sorted = sorted(row, key=lambda i: top_lefts[i, 0])
+            rows.append([rec_texts[i] for i in row_sorted])
+
+        max_cols = max(len(row) for row in rows)
+        return pd.DataFrame([row + [''] * (max_cols - len(row)) for row in rows])
+
     @staticmethod
-    def parse_poly_str(poly_str):
+    def _parse_poly_str(poly_str: str) -> List[List[int]]:
         """解析坐标字符串"""
         cleaned = ''.join(c if c.isdigit() or c.isspace() else ' ' for c in poly_str)
         points = np.fromstring(cleaned, sep=' ', dtype=int).reshape(-1, 2)
         return points.tolist()
 
     @staticmethod
-    def cluster_rows(boxes, threshold=15):
-        """优化行聚类"""
+    def _cluster_rows(boxes: List[List[List[int]]], threshold: int = 15) -> List[np.ndarray]:
+        """行聚类算法"""
         top_lefts = np.array([box[0] for box in boxes])
         y_coords = top_lefts[:, 1]
         sorted_idx = np.argsort(y_coords)
@@ -137,103 +179,78 @@ class TableOCRProcessor:
         split_points = np.where(diffs > threshold)[0] + 1
         return np.split(sorted_idx, split_points)
 
-    def reconstruct_table(self, rec_texts, dt_polys):
-        """重建表格"""
-        print("\n📊 表格重建中...")
-        start_time = time.time()
 
-        try:
-            boxes = [self.parse_poly_str(p) for p in dt_polys]
-            rows_indices = self.cluster_rows(boxes)
-            top_lefts = np.array([box[0] for box in boxes])
+def batch_process_images(image_paths: List[str], output_dir: str = "output"):
+    """
+    批量处理图片
+    :param image_paths: 图片路径列表
+    :param output_dir: 输出目录
+    """
+    print("\n" + "=" * 50)
+    print(f"🛠️ 开始批量处理 {len(image_paths)} 张图片")
+    print("=" * 50)
 
-            rows = []
-            for row in rows_indices:
-                row_sorted = sorted(row, key=lambda i: top_lefts[i, 0])
-                rows.append([rec_texts[i] for i in row_sorted])
-
-            max_cols = max(len(row) for row in rows)
-            df = pd.DataFrame([row + [''] * (max_cols - len(row)) for row in rows])
-
-            print(f"✅ 表格重建完成，耗时: {time.time() - start_time:.2f}秒")
-            return df
-        except Exception as e:
-            print(f"❌ 表格重建失败: {str(e)}")
-            raise
-
-
-def main():
-    # 总计时
     total_start = time.time()
+    processor = TableOCRProcessor()
+
+    results = []
+    for img_path in image_paths:
+        if not os.path.exists(img_path):
+            print(f"\n❌ 文件不存在: {img_path}")
+            continue
+
+        print("\n" + "-" * 50)
+        print(f"📌 正在处理: {os.path.basename(img_path)}")
+        print("-" * 50)
+
+        start_time = time.time()
+        result = processor.process_single_image(img_path, output_dir)
+        result["process_time"] = time.time() - start_time
+        results.append(result)
+
+        if result["success"]:
+            print(f"✅ 处理成功 (耗时: {result['process_time']:.2f}秒)")
+        else:
+            print(f"❌ 处理失败 (耗时: {result['process_time']:.2f}秒)")
+
+    # 打印汇总信息
     print("\n" + "=" * 50)
-    print("🛠️ 表格OCR处理程序启动")
+    print("📊 批量处理结果汇总")
     print("=" * 50)
+    success_count = sum(1 for r in results if r["success"])
+    avg_time = sum(r["process_time"] for r in results) / len(results) if results else 0
 
-    # 输入图像
-    image_path = "wf.jpg"
-    if not os.path.exists(image_path):
-        print(f"\n❌ 图片文件不存在: {image_path}")
-        return
+    print(f"成功: {success_count}/{len(image_paths)}")
+    print(f"平均耗时: {avg_time:.2f}秒/张")
+    print(f"总耗时: {time.time() - total_start:.2f}秒")
 
-    try:
-        # 初始化
-        init_start = time.time()
-        processor = TableOCRProcessor()
-        print(f"\n🔄 初始化总耗时: {time.time() - init_start:.2f}秒")
+    # 保存汇总日志
+    summary_path = os.path.join(output_dir, "processing_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "total_images": len(image_paths),
+            "success_count": success_count,
+            "average_time": avg_time,
+            "details": results
+        }, f, ensure_ascii=False, indent=2)
 
-        # OCR识别
-        ocr_start = time.time()
-        json_path = processor.run_structure_ocr(image_path)
-        print(f"\n🔄 OCR总耗时: {time.time() - ocr_start:.2f}秒")
-
-        # 读取结果
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # 验证数据
-        if not data or not isinstance(data, list):
-            raise ValueError("识别结果格式异常")
-
-        overall_ocr_res = data[0].get('overall_ocr_res')
-        if not overall_ocr_res:
-            raise ValueError("未找到OCR结果")
-
-        rec_texts = overall_ocr_res.get('rec_texts', [])
-        dt_polys = overall_ocr_res.get('dt_polys', [])
-
-        if len(rec_texts) != len(dt_polys):
-            raise ValueError("文本与坐标数量不匹配")
-
-        # 表格重建
-        rebuild_start = time.time()
-        df = processor.reconstruct_table(rec_texts, dt_polys)
-        print(f"\n🔄 表格重建总耗时: {time.time() - rebuild_start:.2f}秒")
-
-        # 保存结果
-        csv_path = "simple_reconstructed_table.csv"
-        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
-        # 结果预览
-        print("\n📄 表格预览:")
-        print(df.head())
-        print(f"\n✅ 结果已保存至: {csv_path}")
-
-    except Exception as e:
-        print(f"\n❌ 处理失败: {str(e)}")
-        return
-
-    # 总耗时
-    total_time = time.time() - total_start
-    print("\n" + "=" * 50)
-    print(f"🏁 全部处理完成！总耗时: {total_time:.2f}秒")
-    print("=" * 50)
+    print(f"\n📝 详细日志已保存至: {summary_path}")
 
 
 if __name__ == "__main__":
+    # 设置混合精度
     try:
         paddle.set_default_dtype('float16')
         print("\n🔼 已启用float16混合精度")
     except:
         print("\n🔽 当前环境不支持float16，使用默认精度")
 
-    main()
+    # 要处理的图片列表
+    image_files = ["t.jpg", "wf.jpg"]  # 添加更多图片路径
+
+    # 过滤出实际存在的文件
+    valid_images = [img for img in image_files if os.path.exists(img)]
+    if not valid_images:
+        print("\n❌ 没有找到可处理的图片文件")
+    else:
+        batch_process_images(valid_images, output_dir="ocr_results")

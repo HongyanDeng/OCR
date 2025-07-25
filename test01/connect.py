@@ -45,8 +45,8 @@ class MilvusUploader:
         # 定义字段
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="row_index", dtype=DataType.INT64, description="行索引"),
-            FieldSchema(name="col_index", dtype=DataType.INT64, description="列索引"),
+            FieldSchema(name="row_index", dtype=DataType.INT32, description="行索引"),
+            FieldSchema(name="col_index", dtype=DataType.INT32, description="列索引"),
             FieldSchema(name="col_name", dtype=DataType.VARCHAR, max_length=256, description="列名"),
             FieldSchema(name="cell_content", dtype=DataType.VARCHAR, max_length=65535, description="单元格内容"),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=128, description="内容向量表示")
@@ -185,6 +185,15 @@ class MilvusUploader:
             df = pd.read_csv(csv_path, encoding="utf-8")
             print(f"📄 成功读取CSV文件: {csv_path}")
             print(f"📊 数据形状: {df.shape[0]}行 x {df.shape[1]}列")
+
+            # 显示数据预览，帮助调试
+            print("📋 数据预览:")
+            print(df.head(3))
+            print("🔢 数据类型:")
+            print(df.dtypes)
+            print("🏷️  列名:")
+            print(list(df.columns))
+
             return df
 
         except Exception as e:
@@ -209,17 +218,45 @@ class MilvusUploader:
             cell_contents = []
             embeddings = []
 
+            print(f"🔄 开始处理数据，共{len(df)}行，{len(df.columns)}列")
+
             # 遍历每一行数据
-            for row_idx, row in df.iterrows():
+            for row_idx, (index, row) in enumerate(df.iterrows()):
                 # 遍历每一列
                 for col_idx, (col_name, cell_value) in enumerate(row.items()):
                     cell_value_str = str(cell_value) if not pd.isna(cell_value) else ""
 
-                    row_indices.append(row_idx)
-                    col_indices.append(col_idx)
-                    col_names.append(str(col_name)[:255])  # 限制列名长度
+                    # 确保索引是整数类型且在合理范围内
+                    try:
+                        # 使用循环索引而不是DataFrame的索引
+                        row_idx_int = int(row_idx)
+                        col_idx_int = int(col_idx)
+
+                        # 检查索引值是否在合理范围内
+                        if row_idx_int < 0 or row_idx_int > 2 ** 31 - 1:
+                            print(f"⚠️  警告: row_index 值 {row_idx_int} 超出范围")
+                            row_idx_int = 0
+
+                        if col_idx_int < 0 or col_idx_int > 2 ** 31 - 1:
+                            print(f"⚠️  警告: col_index 值 {col_idx_int} 超出范围")
+                            col_idx_int = 0
+
+                        row_indices.append(row_idx_int)
+                        col_indices.append(col_idx_int)
+                    except (ValueError, TypeError) as e:
+                        print(f"⚠️  警告: 无法转换索引值 row={row_idx}, col={col_idx}，错误: {str(e)}")
+                        row_indices.append(len(row_indices))  # 使用列表长度作为索引
+                        col_indices.append(len(col_indices))  # 使用列表长度作为索引
+
+                    # 确保列名和内容是字符串类型
+                    col_names.append(str(col_name)[:255] if col_name is not None else f"col_{col_idx}")
                     cell_contents.append(cell_value_str)
                     embeddings.append(self.text_to_vector(cell_value_str, vector_dim))
+
+                    # 调试信息（仅显示前几条）
+                    if len(row_indices) <= 5:
+                        print(
+                            f"📝 记录 {len(row_indices)}: 行={row_idx_int}, 列={col_idx_int}, 列名={col_name}, 内容='{cell_value_str[:50]}...'")
 
             data = {
                 "row_index": row_indices,
@@ -236,7 +273,7 @@ class MilvusUploader:
             print(f"❌ 准备上传数据失败: {str(e)}")
             raise
 
-    def upload_csv_to_milvus(self, csv_path, collection_name, s3_config=None, batch_size=1000):
+    def upload_csv_to_milvus(self, csv_path, collection_name, s3_config=None, batch_size=500):
         """
         将CSV文件上传到Milvus
 
@@ -271,9 +308,31 @@ class MilvusUploader:
                 for key, value_list in data.items():
                     batch_data[key] = value_list[i:batch_end]
 
-                writer.append_row(batch_data)
-                uploaded_records += len(batch_data["row_index"])
-                print(f"📈 已处理: {uploaded_records}/{total_records} 条记录")
+                # 确保数据类型正确
+                validated_batch_data = {}
+                for key, value_list in batch_data.items():
+                    if key in ["row_index", "col_index"]:
+                        # 确保索引字段为整数
+                        validated_batch_data[key] = []
+                        for val in value_list:
+                            try:
+                                validated_batch_data[key].append(int(val))
+                            except (ValueError, TypeError):
+                                validated_batch_data[key].append(0)
+                    elif key in ["col_name", "cell_content"]:
+                        # 确保字符串字段为字符串
+                        validated_batch_data[key] = [str(val) if val is not None else "" for val in value_list]
+                    else:
+                        validated_batch_data[key] = value_list
+
+                try:
+                    writer.append_row(validated_batch_data)
+                    batch_record_count = len(validated_batch_data["row_index"])
+                    uploaded_records += batch_record_count
+                    print(f"📈 已处理: {uploaded_records}/{total_records} 条记录")
+                except Exception as e:
+                    print(f"❌ 批次写入失败 (记录 {i + 1}-{batch_end}): {str(e)}")
+                    # 继续处理下一批次而不是中断
 
             # 提交数据
             writer.commit()
@@ -339,7 +398,7 @@ def main():
             csv_path=CSV_FILE_PATH,
             collection_name=COLLECTION_NAME,
             s3_config=S3_CONFIG,
-            batch_size=1000
+            batch_size=500  # 减小批次大小以减少内存使用
         )
 
         # 显示集合信息

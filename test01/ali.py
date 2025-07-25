@@ -170,7 +170,7 @@ def main():
     print("=" * 50)
 
     # 输入图像
-    image_path = "wf.jpg"
+    image_path = "t.jpg"
     if not os.path.exists(image_path):
         print(f"\n❌ 图片文件不存在: {image_path}")
         return

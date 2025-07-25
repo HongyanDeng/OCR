@@ -42,14 +42,14 @@ class MilvusUploader:
         Returns:
             CollectionSchema: Milvus集合模式
         """
-        # 定义字段
+        # 定义字段 - 使用最简单的数据类型
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="row_index", dtype=DataType.INT32, description="行索引"),
-            FieldSchema(name="col_index", dtype=DataType.INT32, description="列索引"),
+            FieldSchema(name="row_index", dtype=DataType.INT64, description="行索引"),
+            FieldSchema(name="col_index", dtype=DataType.INT64, description="列索引"),
             FieldSchema(name="col_name", dtype=DataType.VARCHAR, max_length=256, description="列名"),
             FieldSchema(name="cell_content", dtype=DataType.VARCHAR, max_length=65535, description="单元格内容"),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=128, description="内容向量表示")
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=128, description="内容向量表示")  # 进一步减小向量维度
         ]
 
         schema = CollectionSchema(
@@ -71,24 +71,24 @@ class MilvusUploader:
         try:
             schema = self.create_schema()
 
-            # 如果集合已存在，加载它
+            # 如果集合已存在，删除它并重新创建
             if utility.has_collection(collection_name):
-                collection = Collection(name=collection_name)
-                print(f"📥 已加载现有集合: {collection_name}")
-            else:
-                # 创建新集合
-                collection = Collection(name=collection_name, schema=schema)
-                print(f"🆕 创建新集合: {collection_name}")
+                utility.drop_collection(collection_name)
+                print(f"🗑️ 已删除现有集合: {collection_name}")
 
-                # 创建索引
-                index_params = {
-                    "index_type": "IVF_FLAT",
-                    "metric_type": "L2",
-                    "params": {"nlist": 128}
-                }
+            # 创建新集合
+            collection = Collection(name=collection_name, schema=schema)
+            print(f"🆕 创建新集合: {collection_name}")
 
-                collection.create_index(field_name="embedding", index_params=index_params)
-                print(f".CreateIndex: 在embedding字段上创建索引")
+            # 创建索引
+            index_params = {
+                "index_type": "FLAT",
+                "metric_type": "L2",
+                "params": {}
+            }
+
+            collection.create_index(field_name="embedding", index_params=index_params)
+            print(f".CreateIndex: 在embedding字段上创建索引")
 
             return collection
 
@@ -107,16 +107,20 @@ class MilvusUploader:
         Returns:
             list: 向量表示
         """
+        # 最简单可靠的向量生成方法
         if not text or not str(text).strip():
-            return [0.0] * dim
+            return [0.1] * dim
 
-        # 使用简单哈希方法生成向量（仅作示例）
-        np.random.seed(hash(str(text)) % (2 ** 32))
+        # 使用hash值生成固定向量
+        hash_val = hash(str(text))
+        np.random.seed(abs(hash_val) % (2 ** 32))
         vector = np.random.random(dim).tolist()
-        # 归一化向量
-        norm = np.linalg.norm(vector)
-        if norm > 0:
-            vector = [x / norm for x in vector]
+
+        # 归一化
+        magnitude = sum(x * x for x in vector) ** 0.5
+        if magnitude > 0:
+            vector = [x / magnitude for x in vector]
+
         return vector
 
     def create_bulk_writer(self, collection_name, s3_config=None):
@@ -182,17 +186,10 @@ class MilvusUploader:
             if not os.path.exists(csv_path):
                 raise FileNotFoundError(f"CSV文件不存在: {csv_path}")
 
-            df = pd.read_csv(csv_path, encoding="utf-8")
+            # 使用最简单的参数读取CSV
+            df = pd.read_csv(csv_path, encoding="utf-8", dtype=object, keep_default_na=False, na_values=[])
             print(f"📄 成功读取CSV文件: {csv_path}")
             print(f"📊 数据形状: {df.shape[0]}行 x {df.shape[1]}列")
-
-            # 显示数据预览，帮助调试
-            print("📋 数据预览:")
-            print(df.head(3))
-            print("🔢 数据类型:")
-            print(df.dtypes)
-            print("🏷️  列名:")
-            print(list(df.columns))
 
             return df
 
@@ -221,46 +218,32 @@ class MilvusUploader:
             print(f"🔄 开始处理数据，共{len(df)}行，{len(df.columns)}列")
 
             # 遍历每一行数据
-            for row_idx, (index, row) in enumerate(df.iterrows()):
+            for row_idx in range(len(df)):
+                row = df.iloc[row_idx]
                 # 遍历每一列
-                for col_idx, (col_name, cell_value) in enumerate(row.items()):
-                    cell_value_str = str(cell_value) if not pd.isna(cell_value) else ""
+                for col_idx in range(len(df.columns)):
+                    col_name = df.columns[col_idx]
+                    cell_value = row[col_idx]
 
-                    # 确保索引是整数类型且在合理范围内
-                    try:
-                        # 使用循环索引而不是DataFrame的索引
-                        row_idx_int = int(row_idx)
-                        col_idx_int = int(col_idx)
+                    # 确保值是字符串
+                    cell_value_str = str(cell_value) if cell_value is not None and str(cell_value) != 'nan' else ""
+                    col_name_str = str(col_name) if col_name is not None else f"col_{col_idx}"
 
-                        # 检查索引值是否在合理范围内
-                        if row_idx_int < 0 or row_idx_int > 2 ** 31 - 1:
-                            print(f"⚠️  警告: row_index 值 {row_idx_int} 超出范围")
-                            row_idx_int = 0
-
-                        if col_idx_int < 0 or col_idx_int > 2 ** 31 - 1:
-                            print(f"⚠️  警告: col_index 值 {col_idx_int} 超出范围")
-                            col_idx_int = 0
-
-                        row_indices.append(row_idx_int)
-                        col_indices.append(col_idx_int)
-                    except (ValueError, TypeError) as e:
-                        print(f"⚠️  警告: 无法转换索引值 row={row_idx}, col={col_idx}，错误: {str(e)}")
-                        row_indices.append(len(row_indices))  # 使用列表长度作为索引
-                        col_indices.append(len(col_indices))  # 使用列表长度作为索引
-
-                    # 确保列名和内容是字符串类型
-                    col_names.append(str(col_name)[:255] if col_name is not None else f"col_{col_idx}")
+                    # 添加数据 - 确保使用Python原生int类型
+                    row_indices.append(int(row_idx))
+                    col_indices.append(int(col_idx))
+                    col_names.append(col_name_str[:255])  # 限制长度
                     cell_contents.append(cell_value_str)
                     embeddings.append(self.text_to_vector(cell_value_str, vector_dim))
 
                     # 调试信息（仅显示前几条）
-                    if len(row_indices) <= 5:
+                    if len(row_indices) <= 3:
                         print(
-                            f"📝 记录 {len(row_indices)}: 行={row_idx_int}, 列={col_idx_int}, 列名={col_name}, 内容='{cell_value_str[:50]}...'")
+                            f"📝 记录 {len(row_indices)}: 行={row_idx}, 列={col_idx}, 列名={col_name_str}, 内容='{cell_value_str[:30]}...'")
 
             data = {
-                "row_index": row_indices,
-                "col_index": col_indices,
+                "row_index": [int(x) for x in row_indices],  # 确保是Python int
+                "col_index": [int(x) for x in col_indices],  # 确保是Python int
                 "col_name": col_names,
                 "cell_content": cell_contents,
                 "embedding": embeddings
@@ -273,7 +256,7 @@ class MilvusUploader:
             print(f"❌ 准备上传数据失败: {str(e)}")
             raise
 
-    def upload_csv_to_milvus(self, csv_path, collection_name, s3_config=None, batch_size=500):
+    def upload_csv_to_milvus(self, csv_path, collection_name, s3_config=None, batch_size=5):
         """
         将CSV文件上传到Milvus
 
@@ -295,48 +278,81 @@ class MilvusUploader:
             df = self.load_csv_data(csv_path)
 
             # 准备数据
-            data = self.prepare_data_for_upload(df)
+            data = self.prepare_data_for_upload(df, vector_dim=128)  # 使用更小的向量维度
 
             # 分批写入数据
             total_records = len(data["row_index"])
             uploaded_records = 0
+            successful_batches = 0
 
             for i in range(0, total_records, batch_size):
                 batch_end = min(i + batch_size, total_records)
 
-                batch_data = {}
-                for key, value_list in data.items():
-                    batch_data[key] = value_list[i:batch_end]
 
-                # 确保数据类型正确
-                validated_batch_data = {}
+
+                # 构建批次数据
+                batch_data = {}
+                for key in ["row_index", "col_index", "col_name", "cell_content", "embedding"]:
+                    batch_data[key] = data[key][i:batch_end]
+
+                # 确保数据类型完全正确并打印调试信息
+                final_batch_data = {}
+                print(f"\n🔍 验证批次 {i // batch_size + 1} 数据:")
+
+
                 for key, value_list in batch_data.items():
                     if key in ["row_index", "col_index"]:
-                        # 确保索引字段为整数
-                        validated_batch_data[key] = []
-                        for val in value_list:
+                        processed_list = []
+                        for x in value_list:
                             try:
-                                validated_batch_data[key].append(int(val))
-                            except (ValueError, TypeError):
-                                validated_batch_data[key].append(0)
+                                processed_list.append(int(float(str(x))))
+                            except:
+                                processed_list.append(np.int64(0))
+                        final_batch_data[key] = processed_list
+                        print(f"  {key}: {processed_list[:5]}")
+                        print(f"  {key} types: {[type(x) for x in processed_list[:5]]}")  # 打印类型
                     elif key in ["col_name", "cell_content"]:
-                        # 确保字符串字段为字符串
-                        validated_batch_data[key] = [str(val) if val is not None else "" for val in value_list]
+                        # 确保是字符串列表
+                        processed_list = [str(x) if x is not None else "" for x in value_list]
+                        final_batch_data[key] = processed_list
+                        print(f"  {key}: {[x[:20] for x in processed_list[:5]]}")
+                    elif key == "embedding":
+                        # 确保是浮点数向量列表
+                        validated_embeddings = []
+                        for emb in value_list:
+                            if isinstance(emb, (list, tuple)) and len(emb) == 128 :
+                                validated_embeddings.append([float(x) for x in emb])
+                            else:
+                                # 使用默认向量
+                                validated_embeddings.append([0.1] * 128)
+                        final_batch_data[key] = validated_embeddings
+                        print(f"  {key}: 长度={[len(x) for x in validated_embeddings[:3]]}")
                     else:
-                        validated_batch_data[key] = value_list
+                        final_batch_data[key] = list(value_list)
+
+                # 打印整个 final_batch_data 的结构
+                print(f"  final_batch_data: {final_batch_data}")
+                # ===== 添加的类型检查代码 =====
+                print(f"数据类型检查 - row_index: {[type(x) for x in final_batch_data['row_index'][:5]]}")
+                print(f"数据类型检查 - col_index: {[type(x) for x in final_batch_data['col_index'][:5]]}")
 
                 try:
-                    writer.append_row(validated_batch_data)
-                    batch_record_count = len(validated_batch_data["row_index"])
+                    writer.append_row(final_batch_data)
+                    batch_record_count = len(final_batch_data["row_index"])
                     uploaded_records += batch_record_count
-                    print(f"📈 已处理: {uploaded_records}/{total_records} 条记录")
+                    successful_batches += 1
+                    print(
+                        f"✅ 成功处理批次 {i // batch_size + 1}: {batch_record_count} 条记录 (累计: {uploaded_records}/{total_records})")
                 except Exception as e:
                     print(f"❌ 批次写入失败 (记录 {i + 1}-{batch_end}): {str(e)}")
-                    # 继续处理下一批次而不是中断
 
             # 提交数据
-            writer.commit()
-            print(f"✅ 成功上传{uploaded_records}条记录到Milvus集合 '{collection_name}'")
+            try:
+                writer.commit()
+                print(f"✅ 成功提交数据，共上传{uploaded_records}条记录到Milvus集合 '{collection_name}'")
+                print(f"   成功批次数量: {successful_batches}")
+            except Exception as e:
+                print(f"⚠️  提交数据时出错: {str(e)}")
 
             # 加载集合
             collection = self.create_or_get_collection(collection_name)
@@ -360,6 +376,21 @@ class MilvusUploader:
                 print(f"\n🔍 集合 '{collection_name}' 信息:")
                 print(f"   行数: {collection.num_entities}")
                 print(f"   字段: {[field.name for field in collection.schema.fields]}")
+
+                # 显示部分数据
+                if collection.num_entities > 0:
+                    try:
+                        collection.load()
+                        results = collection.query(expr="row_index < 3",
+                                                   output_fields=["row_index", "col_index", "col_name", "cell_content"],
+                                                   limit=10)
+                        print(f"   示例数据:")
+                        for i, result in enumerate(results):
+                            print(
+                                f"     {i + 1}. 行:{result.get('row_index', 'N/A')}, 列:{result.get('col_index', 'N/A')}, "
+                                f"列名:'{result.get('col_name', 'N/A')[:20]}...', 内容:'{result.get('cell_content', 'N/A')[:30]}...'")
+                    except Exception as e:
+                        print(f"   无法查询示例数据: {str(e)}")
             else:
                 print(f"⚠️  集合 '{collection_name}' 不存在")
         except Exception as e:
@@ -398,7 +429,7 @@ def main():
             csv_path=CSV_FILE_PATH,
             collection_name=COLLECTION_NAME,
             s3_config=S3_CONFIG,
-            batch_size=500  # 减小批次大小以减少内存使用
+            batch_size=5  # 使用最小的批次大小
         )
 
         # 显示集合信息

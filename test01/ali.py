@@ -84,7 +84,7 @@ class TableOCRProcessor:
 
     def run_structure_ocr(self, image_path):
         """执行OCR识别"""
-        print("\n🔍 OCR识别开始")
+        print(f"\n🔍 OCR识别开始: {image_path}")
         start_time = time.time()
 
         try:
@@ -103,13 +103,18 @@ class TableOCRProcessor:
             result = self.model.predict(temp_img_path)
             print(f"OCR核心处理耗时: {time.time() - ocr_start:.2f}秒")
 
+            # 生成输出文件名
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            # 确保 ocr_process 文件夹存在
+            os.makedirs("ocr_process", exist_ok=True)
+            output_json_path = os.path.join("ocr_process", f"{base_name}_table_output.json")
+
             # 保存结果
-            output_json_path = "raw_table_output.json"
             with open(output_json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2, default=str)
 
             print(f"\n✅ OCR识别完成，总耗时: {time.time() - start_time:.2f}秒")
-            return output_json_path
+            return output_json_path, result
         except Exception as e:
             print(f"❌ OCR识别失败: {str(e)}")
             raise
@@ -121,11 +126,24 @@ class TableOCRProcessor:
                 paddle.device.cuda.empty_cache()
 
     @staticmethod
-    def parse_poly_str(poly_str):
-        """解析坐标字符串"""
-        cleaned = ''.join(c if c.isdigit() or c.isspace() else ' ' for c in poly_str)
-        points = np.fromstring(cleaned, sep=' ', dtype=int).reshape(-1, 2)
-        return points.tolist()
+    def parse_poly_str(poly):
+        """解析坐标字符串或数组"""
+        # 如果是 numpy 数组，直接返回tolist()
+        if isinstance(poly, np.ndarray):
+            return poly.tolist()
+        # 如果是列表，直接返回
+        if isinstance(poly, list):
+            return poly
+        # 如果是字符串，按原来的方式处理
+        if isinstance(poly, str):
+            cleaned = ''.join(c if c.isdigit() or c.isspace() else ' ' for c in poly)
+            points = np.fromstring(cleaned, sep=' ', dtype=int).reshape(-1, 2)
+            return points.tolist()
+        # 其他情况，尝试转换为 numpy 数组
+        try:
+            return np.array(poly).tolist()
+        except:
+            raise ValueError(f"无法解析坐标数据: {poly}")
 
     @staticmethod
     def cluster_rows(boxes, threshold=15):
@@ -162,33 +180,23 @@ class TableOCRProcessor:
             raise
 
 
-def main():
-    # 总计时
-    total_start = time.time()
-    print("\n" + "=" * 50)
-    print("🛠️ 表格OCR处理程序启动")
-    print("=" * 50)
+def get_image_files(folder_path):
+    """获取文件夹中所有图片文件"""
+    image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+    image_files = []
 
-    # 输入图像
-    image_path = "t.jpg"
-    if not os.path.exists(image_path):
-        print(f"\n❌ 图片文件不存在: {image_path}")
-        return
+    for file in os.listdir(folder_path):
+        if file.lower().endswith(image_extensions):
+            image_files.append(file)
 
+    return image_files
+
+
+def process_single_image(processor, image_path, base_name):
+    """处理单张图片"""
     try:
-        # 初始化
-        init_start = time.time()
-        processor = TableOCRProcessor()
-        print(f"\n🔄 初始化总耗时: {time.time() - init_start:.2f}秒")
-
         # OCR识别
-        ocr_start = time.time()
-        json_path = processor.run_structure_ocr(image_path)
-        print(f"\n🔄 OCR总耗时: {time.time() - ocr_start:.2f}秒")
-
-        # 读取结果
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        json_path, data = processor.run_structure_ocr(image_path)
 
         # 验证数据
         if not data or not isinstance(data, list):
@@ -205,27 +213,84 @@ def main():
             raise ValueError("文本与坐标数量不匹配")
 
         # 表格重建
-        rebuild_start = time.time()
         df = processor.reconstruct_table(rec_texts, dt_polys)
-        print(f"\n🔄 表格重建总耗时: {time.time() - rebuild_start:.2f}秒")
 
-        # 保存结果
-        csv_path = "simple_reconstructed_table.csv"
-        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        # 保存结果到 ocr_results 文件夹 (保存为TXT文件)
+        os.makedirs("ocr_results", exist_ok=True)
+        txt_path = os.path.join("ocr_results", f"{base_name}_reconstructed_table.txt")
+
+        # 将DataFrame保存为TXT文件
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            # 写入表头
+            f.write('\t'.join(df.columns.astype(str)) + '\n')
+            # 写入数据行
+            for _, row in df.iterrows():
+                f.write('\t'.join(row.astype(str)) + '\n')
 
         # 结果预览
-        print("\n📄 表格预览:")
+        print(f"\n📄 {base_name} 表格预览:")
         print(df.head())
-        print(f"\n✅ 结果已保存至: {csv_path}")
+        print(f"\n✅ 结果已保存至: {txt_path}")
+
+        return True
+    except Exception as e:
+        print(f"\n❌ 处理 {image_path} 失败: {str(e)}")
+        return False
+
+
+def main():
+    # 总计时
+    total_start = time.time()
+    print("\n" + "=" * 50)
+    print("🛠️ 表格OCR处理程序启动")
+    print("=" * 50)
+
+    # 图片文件夹路径
+    image_folder = "image"
+    if not os.path.exists(image_folder):
+        print(f"\n❌ 图片文件夹不存在: {image_folder}")
+        return
+
+    # 获取所有图片文件
+    image_files = get_image_files(image_folder)
+    if not image_files:
+        print(f"\n❌ 在 {image_folder} 文件夹中未找到图片文件")
+        return
+
+    print(f"\n📁 找到 {len(image_files)} 个图片文件:")
+    for img_file in image_files:
+        print(f"  - {img_file}")
+
+    try:
+        # 初始化
+        init_start = time.time()
+        processor = TableOCRProcessor()
+        print(f"\n🔄 初始化总耗时: {time.time() - init_start:.2f}秒")
+
+        # 处理所有图片
+        success_count = 0
+        for img_file in image_files:
+            image_path = os.path.join(image_folder, img_file)
+            base_name = os.path.splitext(img_file)[0]
+
+            print(f"\n{'-' * 50}")
+            print(f"正在处理: {img_file}")
+            print(f"{'-' * 50}")
+
+            if process_single_image(processor, image_path, base_name):
+                success_count += 1
+
+        # 总结
+        print(f"\n{'=' * 50}")
+        print(f"🏁 批量处理完成！成功处理 {success_count}/{len(image_files)} 个文件")
 
     except Exception as e:
-        print(f"\n❌ 处理失败: {str(e)}")
+        print(f"\n❌ 批量处理过程中发生错误: {str(e)}")
         return
 
     # 总耗时
     total_time = time.time() - total_start
-    print("\n" + "=" * 50)
-    print(f"🏁 全部处理完成！总耗时: {total_time:.2f}秒")
+    print(f"⏱️  全部处理完成！总耗时: {total_time:.2f}秒")
     print("=" * 50)
 
 

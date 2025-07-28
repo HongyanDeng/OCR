@@ -56,7 +56,7 @@ class TableOCRProcessor:
         print(f"模型初始化完成，耗时: {time.time() - start_time:.2f}秒")
         return model
 
-    def preprocess_image(self, image_path, max_size=1200):
+    def preprocess_image(self, image_path, max_size=3200):
         """
         图像预处理
         修复RGBA转JPEG问题并优化缩放逻辑

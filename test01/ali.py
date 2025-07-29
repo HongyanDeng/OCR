@@ -20,6 +20,8 @@ class TableOCRProcessor:
         self.model = self._init_model()
         # 初始化中文常用词典（简化版）
         self.chinese_words = self._load_chinese_words()
+        # 初始化 pycorrector 错别字检测库
+        self._init_pycorrector()
 
     def _print_system_info(self):
         """打印系统和硬件信息"""
@@ -60,6 +62,19 @@ class TableOCRProcessor:
 
         print(f"模型初始化完成，耗时: {time.time() - start_time:.2f}秒")
         return model
+
+    def _init_pycorrector(self):
+        """初始化pycorrector库"""
+        try:
+            import pycorrector
+            self.pycorrector = pycorrector
+            print("\n✅ pycorrector库已加载")
+        except ImportError:
+            print("\n⚠️ 未安装pycorrector库，将使用基础错别字检测")
+            self.pycorrector = None
+        except Exception as e:
+            print(f"\n⚠️ pycorrector初始化失败: {str(e)}")
+            self.pycorrector = None
 
     def _load_chinese_words(self):
         """加载中文常用词典（简化版）"""
@@ -253,6 +268,21 @@ class TableOCRProcessor:
         检查文本中的错别字
         """
         typos = []
+
+        # 使用 pycorrector 检测错别字（如果可用）
+        if self.pycorrector:
+            try:
+                errors = self.pycorrector.detect(text)
+                for error in errors:
+                    typos.append({
+                        "typo": error[0],
+                        "suggestion": error[1],
+                        "position": error[2],
+                        "context": text[max(0, error[2] - 10):error[3] + 10]
+                    })
+            except Exception as e:
+                print(f"pycorrector检测 '{text}' 时出错: {str(e)}")
+
         # 移除标点符号和数字，只检查中文字符
         chinese_chars = re.findall(r'[\u4e00-\u9fff]+', text)
         chinese_text = ''.join(chinese_chars)
@@ -315,6 +345,23 @@ class TableOCRProcessor:
             issues.append("特殊字符比例过高")
 
         return issues
+
+    def post_process_texts(self, texts):
+        """
+        对OCR识别结果进行后处理优化，使用pycorrector进行错别字纠正
+        """
+        processed_texts = []
+        for text in texts:
+            processed_text = text
+            # 使用 pycorrector 进行纠错（如果可用）
+            if self.pycorrector:
+                try:
+                    corrected_text, _ = self.pycorrector.correct(processed_text)
+                    processed_text = corrected_text
+                except Exception as e:
+                    print(f"pycorrector处理 '{processed_text}' 时出错: {str(e)}")
+            processed_texts.append(processed_text)
+        return processed_texts
 
 
 def get_image_files(folder_path):
@@ -431,8 +478,11 @@ def process_single_image(processor, image_path, base_name):
         if len(rec_texts) != len(dt_polys):
             raise ValueError("文本与坐标数量不匹配")
 
-        # 质量评估
-        quality_report = assess_ocr_quality(rec_texts)
+        # 对OCR结果进行后处理（错别字纠正）
+        processed_texts = processor.post_process_texts(rec_texts)
+
+        # 质量评估（使用处理后的文本）
+        quality_report = assess_ocr_quality(processed_texts)
         print(f"\n📈 OCR质量评估报告:")
         print(f"  质量得分: {quality_report['quality_score']:.2f}")
         if quality_report['issues']:
@@ -441,8 +491,8 @@ def process_single_image(processor, image_path, base_name):
         for key, value in quality_report['metrics'].items():
             print(f"    {key}: {value:.2%}")
 
-        # 错别字和语义检查
-        typo_issues = processor.detect_typos_and_inconsistencies(rec_texts)
+        # 错别字和语义检查（使用处理后的文本）
+        typo_issues = processor.detect_typos_and_inconsistencies(processed_texts)
         if typo_issues:
             print(f"\n❗ 发现 {len(typo_issues)} 个潜在问题:")
             for issue in typo_issues[:5]:  # 只显示前5个问题
@@ -453,10 +503,10 @@ def process_single_image(processor, image_path, base_name):
                 print(f"    ... 还有 {len(typo_issues) - 5} 个问题")
 
         # 抽样检查（10%的文本）
-        sample_check_results(image_path, base_name, rec_texts, 0.1)
+        sample_check_results(image_path, base_name, processed_texts, 0.1)
 
-        # 表格重建
-        df = processor.reconstruct_table(rec_texts, dt_polys)
+        # 表格重建（使用处理后的文本）
+        df = processor.reconstruct_table(processed_texts, dt_polys)
 
         # 保存结果到 ocr_results 文件夹 (保存为TXT和Excel文件)
         os.makedirs("ocr_results", exist_ok=True)

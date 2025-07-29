@@ -155,6 +155,16 @@ class TableOCRProcessor:
         split_points = np.where(diffs > threshold)[0] + 1
         return np.split(sorted_idx, split_points)
 
+    @staticmethod
+    def cluster_columns(boxes, threshold=15):
+        """列聚类"""
+        top_lefts = np.array([box[0] for box in boxes])
+        x_coords = top_lefts[:, 0]
+        sorted_idx = np.argsort(x_coords)
+        diffs = np.diff(x_coords[sorted_idx])
+        split_points = np.where(diffs > threshold)[0] + 1
+        return np.split(sorted_idx, split_points)
+
     def reconstruct_table(self, rec_texts, dt_polys):
         """重建表格"""
         print("\n📊 表格重建中...")
@@ -162,16 +172,24 @@ class TableOCRProcessor:
 
         try:
             boxes = [self.parse_poly_str(p) for p in dt_polys]
-            rows_indices = self.cluster_rows(boxes)
-            top_lefts = np.array([box[0] for box in boxes])
+            row_indices = self.cluster_rows(boxes)
+            col_indices = self.cluster_columns(boxes)
 
-            rows = []
-            for row in rows_indices:
-                row_sorted = sorted(row, key=lambda i: top_lefts[i, 0])
-                rows.append([rec_texts[i] for i in row_sorted])
+            # 创建空表格
+            max_rows = len(row_indices)
+            max_cols = len(col_indices)
+            table = [[""] * max_cols for _ in range(max_rows)]
 
-            max_cols = max(len(row) for row in rows)
-            df = pd.DataFrame([row + [''] * (max_cols - len(row)) for row in rows])
+            # 填充表格
+            for i, row in enumerate(row_indices):
+                for j, col in enumerate(col_indices):
+                    cell_texts = []
+                    for k in row:
+                        if k in col:
+                            cell_texts.append(rec_texts[k])
+                    table[i][j] = " ".join(cell_texts)
+
+            df = pd.DataFrame(table)
 
             print(f"✅ 表格重建完成，耗时: {time.time() - start_time:.2f}秒")
             return df
@@ -215,11 +233,11 @@ def process_single_image(processor, image_path, base_name):
         # 表格重建
         df = processor.reconstruct_table(rec_texts, dt_polys)
 
-        # 保存结果到 ocr_results 文件夹 (保存为TXT文件)
+        # 保存结果到 ocr_results 文件夹 (保存为TXT和Excel文件)
         os.makedirs("ocr_results", exist_ok=True)
-        txt_path = os.path.join("ocr_results", f"{base_name}_reconstructed_table.txt")
 
-        # 将DataFrame保存为TXT文件
+        # 保存为TXT文件
+        txt_path = os.path.join("ocr_results", f"{base_name}_reconstructed_table.txt")
         with open(txt_path, 'w', encoding='utf-8') as f:
             # 写入表头
             f.write('\t'.join(df.columns.astype(str)) + '\n')
@@ -227,16 +245,19 @@ def process_single_image(processor, image_path, base_name):
             for _, row in df.iterrows():
                 f.write('\t'.join(row.astype(str)) + '\n')
 
+        # 保存为Excel文件
+        excel_path = os.path.join("ocr_xlsx", f"{base_name}_reconstructed_table.xlsx")
+        df.to_excel(excel_path, index=False)
+
         # 结果预览
         print(f"\n📄 {base_name} 表格预览:")
         print(df.head())
-        print(f"\n✅ 结果已保存至: {txt_path}")
+        print(f"\n✅ 结果已保存至: {txt_path} 和 {excel_path}")
 
         return True
     except Exception as e:
         print(f"\n❌ 处理 {image_path} 失败: {str(e)}")
         return False
-
 
 def main():
     # 总计时
